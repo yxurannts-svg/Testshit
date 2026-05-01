@@ -1,0 +1,285 @@
+-- ============================================================================
+-- LURAPH V14+ STEALTH ENVIRONMENT LOADER
+-- Designed to create a "clean room" for obfuscated scripts
+-- Run this BEFORE loading your Luraph-protected script
+-- ============================================================================
+
+local StealthEnv = {}
+
+-- ============================================================================
+-- 1. PROXY PCALL - Bypasses Anti-Format Stack Trace Checks
+-- ============================================================================
+-- Luraph uses pcall to trigger errors, then inspects stack traces for line numbers.
+-- If line numbers don't match (because you beautified/edited), it self-destructs.
+-- This proxy intercepts error messages and normalizes all line numbers to "1".
+
+local original_pcall = pcall
+local original_xpcall = xpcall
+
+local function sanitize_error(err)
+    if type(err) == "string" then
+        -- Replace any line number pattern with ":1:"
+        -- Matches patterns like ":123:" or "line 456"
+        err = err:gsub(":%d+:", ":1:")
+        err = err:gsub("line %d+", "line 1")
+    end
+    return err
+end
+
+_G.pcall = function(func, ...)
+    local results = {original_pcall(func, ...)}
+    if not results[1] and results[2] then
+        results[2] = sanitize_error(results[2])
+    end
+    return table.unpack(results)
+end
+
+_G.xpcall = function(func, errhandler, ...)
+    local custom_handler = function(err)
+        return errhandler(sanitize_error(err))
+    end
+    return original_xpcall(func, custom_handler, ...)
+end
+
+print("[Stealth] Proxy pcall/xpcall installed - line numbers normalized")
+
+-- ============================================================================
+-- 2. GLOBAL SPOOFING - Hides Executor Signatures
+-- ============================================================================
+-- Luraph checks for common executor globals (syn, fluxus, getgenv, etc.)
+-- We temporarily hide these during initialization, then restore them.
+
+StealthEnv.hidden_globals = {}
+
+function StealthEnv.hide_executor_signatures()
+    local common_signatures = {
+        "syn", "secure_load", "fluxus", "getgenv", "getrenv",
+        "get_hidden_env", "getrawmetatable", "hookmetamethod",
+        "hookfunction", "getnamecallmethod", "getcallingscript"
+    }
+    
+    for _, name in ipairs(common_signatures) do
+        if _G[name] then
+            StealthEnv.hidden_globals[name] = _G[name]
+            _G[name] = nil
+        end
+    end
+    
+    print("[Stealth] Executor signatures hidden:", #common_signatures, "globals masked")
+end
+
+function StealthEnv.restore_executor_signatures()
+    for name, value in pairs(StealthEnv.hidden_globals) do
+        _G[name] = value
+    end
+    StealthEnv.hidden_globals = {}
+    print("[Stealth] Executor signatures restored")
+end
+
+-- ============================================================================
+-- 3. ANTI-DEBUG SHIELD - Spoofs Environment Queries
+-- ============================================================================
+-- Hooks debug.getinfo and getfenv to return "clean" environment data
+
+if debug and debug.getinfo then
+    local original_getinfo = debug.getinfo
+    
+    debug.getinfo = function(level, what)
+        local info = original_getinfo(level, what)
+        if info then
+            -- Spoof source to look like it's from the game, not an executor
+            if info.source and info.source:find("@") then
+                info.source = "@game.script"
+            end
+            -- Normalize line info
+            if info.currentline then
+                info.currentline = 1
+            end
+            if info.linedefined then
+                info.linedefined = 1
+            end
+        end
+        return info
+    end
+    
+    print("[Stealth] debug.getinfo hooked - environment spoofed")
+end
+
+-- Hook getfenv to return sanitized environment
+if getfenv then
+    local original_getfenv = getfenv
+    
+    getfenv = function(level)
+        local env = original_getfenv(level)
+        -- Remove any executor-specific keys from the returned environment
+        if type(env) == "table" then
+            local clean_env = {}
+            for k, v in pairs(env) do
+                -- Only include standard Lua globals
+                if type(k) == "string" and not k:match("^get") and not k:match("^hook") then
+                    clean_env[k] = v
+                end
+            end
+            return clean_env
+        end
+        return env
+    end
+    
+    print("[Stealth] getfenv hooked - cleaned environment table")
+end
+
+-- ============================================================================
+-- 4. FUNCTION HOOK LOGGING (Optional) - See What The Script Is Doing
+-- ============================================================================
+-- Use this to understand what game functions your script is calling
+
+StealthEnv.hooks = {}
+
+function StealthEnv.hook_function(func_table, func_name, callback)
+    if not func_table or not func_table[func_name] then
+        warn("[Stealth] Cannot hook", func_name, "- function not found")
+        return
+    end
+    
+    local original_func = func_table[func_name]
+    
+    func_table[func_name] = function(...)
+        local args = {...}
+        -- Log the call
+        callback(func_name, args)
+        -- Execute original
+        return original_func(...)
+    end
+    
+    table.insert(StealthEnv.hooks, {func_table, func_name, original_func})
+    print("[Stealth] Hooked function:", func_name)
+end
+
+function StealthEnv.unhook_all()
+    for _, hook_data in ipairs(StealthEnv.hooks) do
+        local func_table, func_name, original_func = table.unpack(hook_data)
+        func_table[func_name] = original_func
+    end
+    StealthEnv.hooks = {}
+    print("[Stealth] All hooks removed")
+end
+
+-- Example: Hook RemoteEvent firing to see what your script sends
+--[[
+if game and game.GetService then
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    if ReplicatedStorage:FindFirstChild("SomeRemote") then
+        local remote = ReplicatedStorage.SomeRemote
+        StealthEnv.hook_function(remote, "FireServer", function(name, args)
+            print("[Hook] FireServer called with:", table.unpack(args))
+        end)
+    end
+end
+]]--
+
+-- ============================================================================
+-- 5. SHADOW LOAD - Load Script Without Modifying It
+-- ============================================================================
+-- Loads your Luraph script into memory without changing its checksum
+-- You can then hook functions it uses to modify behavior
+
+function StealthEnv.shadow_load(script_string)
+    -- Hide executor signatures before the script initializes
+    StealthEnv.hide_executor_signatures()
+    
+    -- Load the script
+    local script_func, load_error = loadstring(script_string)
+    
+    if not script_func then
+        error("[Stealth] Failed to load script: " .. tostring(load_error))
+    end
+    
+    print("[Stealth] Script loaded into memory - checksum preserved")
+    
+    -- Execute in protected environment
+    local success, exec_error = pcall(script_func)
+    
+    -- Restore executor signatures after initialization
+    task.wait(0.5) -- Give it a moment to initialize
+    StealthEnv.restore_executor_signatures()
+    
+    if not success then
+        error("[Stealth] Script execution failed: " .. tostring(exec_error))
+    end
+    
+    print("[Stealth] Script executed successfully")
+end
+
+-- ============================================================================
+-- 6. MEMORY SCANNER (Advanced) - Find Variables Post-Execution
+-- ============================================================================
+-- Use this AFTER your script has loaded to find and modify internal state
+
+function StealthEnv.scan_memory(search_term, search_type)
+    search_type = search_type or "string"
+    local results = {}
+    
+    if not getgc then
+        warn("[Stealth] getgc not available - cannot scan memory")
+        return results
+    end
+    
+    for _, obj in pairs(getgc(true)) do
+        if search_type == "string" and type(obj) == "string" then
+            if obj:lower():find(search_term:lower()) then
+                table.insert(results, obj)
+            end
+        elseif search_type == "table" and type(obj) == "table" then
+            for k, v in pairs(obj) do
+                if tostring(k):lower():find(search_term:lower()) or 
+                   tostring(v):lower():find(search_term:lower()) then
+                    table.insert(results, obj)
+                    break
+                end
+            end
+        end
+    end
+    
+    print("[Stealth] Memory scan complete:", #results, "matches found")
+    return results
+end
+
+-- Example: Find "whitelist" or "premium" variables after script loads
+--[[
+task.wait(2) -- Let script fully initialize
+local whitelist_tables = StealthEnv.scan_memory("whitelist", "table")
+for _, tbl in ipairs(whitelist_tables) do
+    -- Examine or modify the table
+    print(tbl)
+end
+]]--
+
+-- ============================================================================
+-- USAGE EXAMPLE
+-- ============================================================================
+--[[
+
+-- Step 1: Load this stealth environment
+-- (You're already doing this by running this file)
+
+-- Step 2: Load your obfuscated script using shadow_load
+local obfuscated_code = [[
+    -- Your Luraph v14 obfuscated script here
+    -- Paste the entire thing as a string
+]]
+
+StealthEnv.shadow_load(obfuscated_code)
+
+-- Step 3 (Optional): Hook functions to modify behavior
+-- Or use memory scanner to find internal variables
+
+-- Step 4: Profit - your script runs with integrity checks bypassed
+
+]]--
+
+print("=".rep(60))
+print("[Stealth Environment] Fully loaded and active")
+print("Use StealthEnv.shadow_load(code) to execute your script")
+print("=".rep(60))
+
+return StealthEnv
